@@ -1,0 +1,9 @@
+# .gitignore 파일 생성
+echo "# 민감한 정보
+.env
+credentials.json
+*.key
+config.json
+secrets/
+__pycache__/
+*.pyc" > .gitignore
