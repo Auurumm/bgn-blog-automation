@@ -1,44 +1,50 @@
 #!/usr/bin/env python3
 """
-BGN 밝은눈안과 블로그 완전 자동화 통합 시스템
-- 인터뷰 분석 (OpenAI GPT-4)
-- 콘텐츠 생성 (Markdown → HTML)
-- 이미지 자동 생성 (DALL-E 3)
-- 워드프레스 자동 포스팅
-- 구글 시트 자동 관리
-- Streamlit 웹 인터페이스
+BGN 밝은눈안과 블로그 완전 자동화 통합 시스템 (REST API 버전)
+- WordPress REST API 사용으로 XML-RPC 문제 해결
+- 더 안전하고 현대적인 API 접근 방식
+- 향상된 오류 처리 및 디버깅
 """
 
 import streamlit as st
-import openai
-import pandas as pd
-import requests
-import base64
-from PIL import Image, ImageEnhance
-import io
-from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
-import time
+import sys
 import json
 import re
+import time
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, asdict
+import io
+import base64
 import mimetypes
 
 # 환경변수 로드
+from dotenv import load_dotenv
 load_dotenv()
 
-# 필수 라이브러리 import (선택적)
+# 필수 라이브러리
 try:
-    from wordpress_xmlrpc import Client, WordPressPost
-    from wordpress_xmlrpc.methods.posts import NewPost
-    from wordpress_xmlrpc.methods.media import UploadFile
-    WORDPRESS_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    WORDPRESS_AVAILABLE = False
+    OPENAI_AVAILABLE = False
 
+try:
+    import requests
+    from PIL import Image, ImageEnhance
+    IMAGE_AVAILABLE = True
+except ImportError:
+    IMAGE_AVAILABLE = False
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+# 선택적 라이브러리들 (Google Sheets만 유지)
 try:
     from googleapiclient.discovery import build
     from google.oauth2.service_account import Credentials as ServiceAccountCredentials
@@ -70,7 +76,7 @@ class Settings:
     DALLE_SIZE = "1024x1024"
     DALLE_QUALITY = "standard"
     
-    # 워드프레스 설정
+    # 워드프레스 REST API 설정
     WORDPRESS_URL = os.getenv("WORDPRESS_URL", "")
     WORDPRESS_USERNAME = os.getenv("WORDPRESS_USERNAME", "")
     WORDPRESS_PASSWORD = os.getenv("WORDPRESS_PASSWORD", "")
@@ -252,18 +258,74 @@ class PostPublishResult:
     error_message: str = ""
 
 # ========================================
-# 인터뷰 분석기
+# 의존성 체크 함수
 # ========================================
 
-class InterviewAnalyzer:
-    """직원 인터뷰 분석기"""
+def check_dependencies():
+    """필수 및 선택적 라이브러리 체크"""
+    missing_required = []
+    missing_optional = []
+    
+    # 필수 라이브러리 체크
+    if not OPENAI_AVAILABLE:
+        missing_required.append("openai")
+    if not IMAGE_AVAILABLE:
+        missing_required.append("Pillow requests")
+    
+    # 선택적 라이브러리 체크
+    if not GOOGLE_SHEETS_AVAILABLE:
+        missing_optional.append("google-api-python-client google-auth-httplib2 google-auth-oauthlib gspread")
+    if not PANDAS_AVAILABLE:
+        missing_optional.append("pandas")
+    
+    return missing_required, missing_optional
+
+def display_dependency_warnings():
+    """의존성 경고 표시"""
+    missing_required, missing_optional = check_dependencies()
+    
+    if missing_required:
+        st.error(f"""
+        ❌ **필수 라이브러리 미설치**
+        
+        다음 라이브러리를 설치해야 합니다:
+        ```bash
+        pip install {' '.join(missing_required)}
+        ```
+        """)
+        return False
+    
+    if missing_optional:
+        st.warning(f"""
+        ⚠️ **선택적 기능 제한**
+        
+        일부 기능을 사용하려면 추가 라이브러리가 필요합니다:
+        ```bash
+        pip install {' '.join(missing_optional)}
+        ```
+        """)
+    
+    return True
+
+# ========================================
+# 안전한 인터뷰 분석기
+# ========================================
+
+class SafeInterviewAnalyzer:
+    """안전한 인터뷰 분석기 (오류 처리 강화)"""
     
     def __init__(self, api_key: str = None):
+        if not OPENAI_AVAILABLE:
+            raise ImportError("OpenAI 라이브러리가 설치되지 않았습니다.")
+        
         self.api_key = api_key or Settings.OPENAI_API_KEY
         if not self.api_key:
             raise ValueError("OpenAI API 키가 설정되지 않았습니다.")
         
-        self.client = openai.OpenAI(api_key=self.api_key)
+        try:
+            self.client = openai.OpenAI(api_key=self.api_key)
+        except Exception as e:
+            raise ConnectionError(f"OpenAI 클라이언트 초기화 실패: {str(e)}")
         
         # 분석 패턴 설정
         self.medical_terms = [
@@ -279,8 +341,11 @@ class InterviewAnalyzer:
         }
     
     def analyze_interview(self, interview_text: str) -> InterviewAnalysisResult:
-        """인터뷰 텍스트 분석"""
+        """안전한 인터뷰 분석"""
         try:
+            if not interview_text or len(interview_text.strip()) < 10:
+                return self._create_default_result()
+            
             # 텍스트 전처리
             cleaned_text = self._preprocess_text(interview_text)
             
@@ -290,14 +355,6 @@ class InterviewAnalyzer:
             knowledge = self._extract_knowledge(cleaned_text)
             customer_insights = self._extract_customer_insights(cleaned_text)
             hospital_strengths = self._extract_hospital_strengths(cleaned_text)
-            
-            # AI 기반 고급 분석 (선택적)
-            if self.api_key:
-                try:
-                    ai_enhancement = self._ai_enhanced_analysis(cleaned_text[:2000])
-                    employee, knowledge = self._merge_ai_results(employee, knowledge, ai_enhancement)
-                except Exception as e:
-                    logger.warning(f"AI 분석 실패: {str(e)}")
             
             # 메타데이터 생성
             metadata = {
@@ -317,7 +374,6 @@ class InterviewAnalyzer:
             
         except Exception as e:
             logger.error(f"인터뷰 분석 실패: {str(e)}")
-            # 기본 결과 반환
             return self._create_default_result()
     
     def _preprocess_text(self, text: str) -> str:
@@ -331,9 +387,17 @@ class InterviewAnalyzer:
         employee = EmployeeProfile()
         
         # 이름 추출
-        name_match = re.search(r'저는\s*([가-힣]{2,4})', text)
-        if name_match:
-            employee.name = name_match.group(1)
+        name_patterns = [
+            r'저는\s*([가-힣]{2,4})',
+            r'([가-힣]{2,4})\s*(대리|과장|팀장)',
+            r'제가\s*([가-힣]{2,4})'
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, text)
+            if match:
+                employee.name = match.group(1)
+                break
         
         # 직책 추출
         if '대리' in text:
@@ -352,17 +416,30 @@ class InterviewAnalyzer:
             employee.department = '검안팀'
         
         # 경력 추출
-        exp_match = re.search(r'(\d+)년.*?(경력|차)', text)
-        if exp_match:
-            employee.experience_years = int(exp_match.group(1))
+        exp_patterns = [
+            r'(\d+)년.*?(경력|차)',
+            r'경력.*?(\d+)년',
+            r'(\d+)년.*?정도'
+        ]
+        
+        for pattern in exp_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    employee.experience_years = int(match.group(1))
+                    break
+                except (ValueError, IndexError):
+                    continue
         
         # 전문분야 추출
-        if '대학' in text:
+        if '대학' in text and '제휴' in text:
             employee.specialty_areas.append('대학 제휴')
         if '출장검진' in text:
             employee.specialty_areas.append('출장검진')
         if '상담' in text:
             employee.specialty_areas.append('고객 상담')
+        if '축제' in text:
+            employee.specialty_areas.append('축제 마케팅')
         
         return employee
     
@@ -411,8 +488,10 @@ class InterviewAnalyzer:
                     knowledge.technical_terms.append(term)
         
         # 장비 관련
-        if '장비' in text or 'OCT' in text:
-            knowledge.equipment.append('안과 검사 장비')
+        equipment_keywords = ['장비', 'OCT', '검사기', '레이저']
+        for keyword in equipment_keywords:
+            if keyword in text:
+                knowledge.equipment.append(f'{keyword} 관련')
         
         # 전문성 평가
         expertise_count = len(knowledge.procedures) + len(knowledge.technical_terms)
@@ -432,12 +511,16 @@ class InterviewAnalyzer:
         # 자주 받는 질문
         if '질문' in text or '궁금' in text:
             insights.frequent_questions.append('검사 과정에 대한 문의')
+        if '비용' in text or '가격' in text:
+            insights.frequent_questions.append('비용 관련 문의')
         
         # 고객층 추출
         if '대학생' in text:
             insights.target_demographics.append('대학생')
         if '직장인' in text:
             insights.target_demographics.append('직장인')
+        if '어르신' in text or '노인' in text:
+            insights.target_demographics.append('중장년층')
         
         return insights
     
@@ -448,76 +531,24 @@ class InterviewAnalyzer:
         # 위치 장점
         if '롯데타워' in text or '잠실' in text:
             strengths.location_benefits.append('롯데타워 위치')
+        if '교통' in text or '접근' in text:
+            strengths.location_benefits.append('교통 편의성')
         
         # 경쟁 우위
         if '무사고' in text or '26년' in text:
             strengths.competitive_advantages.append('26년 무사고 기록')
+        if '경험' in text and '년' in text:
+            strengths.competitive_advantages.append('풍부한 경험')
         
         # 특별 서비스
         if '할인' in text:
             strengths.unique_services.append('학생 할인 혜택')
         if '축제' in text:
             strengths.unique_services.append('대학 축제 상담')
+        if '출장' in text:
+            strengths.unique_services.append('출장 검진 서비스')
         
         return strengths
-    
-    def _ai_enhanced_analysis(self, text: str) -> Dict:
-        """AI 기반 고급 분석"""
-        try:
-            prompt = f"""
-            다음 BGN 밝은눈안과 직원 인터뷰를 분석하여 JSON으로 결과를 제공해주세요.
-
-            인터뷰: {text}
-
-            다음 정보를 추출해주세요:
-            {{
-                "employee_name": "이름",
-                "department": "부서",
-                "position": "직책", 
-                "specialties": ["전문분야들"],
-                "procedures": ["담당 시술/검사들"],
-                "personality_traits": ["성격 특성들"]
-            }}
-            """
-            
-            response = self.client.chat.completions.create(
-                model=Settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "당신은 의료 인사 분석 전문가입니다. JSON 형태로만 응답하세요."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-            
-            result = response.choices[0].message.content
-            return json.loads(result)
-            
-        except Exception as e:
-            logger.warning(f"AI 분석 실패: {str(e)}")
-            return {}
-    
-    def _merge_ai_results(self, employee: EmployeeProfile, knowledge: ProfessionalKnowledge, ai_data: Dict) -> Tuple:
-        """AI 결과 병합"""
-        if not ai_data:
-            return employee, knowledge
-        
-        try:
-            if ai_data.get('employee_name') and not employee.name:
-                employee.name = ai_data['employee_name']
-            
-            if ai_data.get('specialties'):
-                employee.specialty_areas.extend(ai_data['specialties'])
-                employee.specialty_areas = list(set(employee.specialty_areas))
-            
-            if ai_data.get('procedures'):
-                knowledge.procedures.extend(ai_data['procedures'])
-                knowledge.procedures = list(set(knowledge.procedures))
-                
-        except Exception as e:
-            logger.warning(f"AI 결과 병합 실패: {str(e)}")
-        
-        return employee, knowledge
     
     def _calculate_confidence(self, employee: EmployeeProfile, knowledge: ProfessionalKnowledge) -> float:
         """신뢰도 계산"""
@@ -547,21 +578,27 @@ class InterviewAnalyzer:
         )
 
 # ========================================
-# 콘텐츠 생성기
+# 안전한 콘텐츠 생성기
 # ========================================
 
-class ContentGenerator:
-    """블로그 콘텐츠 생성기"""
+class SafeContentGenerator:
+    """안전한 콘텐츠 생성기"""
     
     def __init__(self, api_key: str = None):
+        if not OPENAI_AVAILABLE:
+            raise ImportError("OpenAI 라이브러리가 설치되지 않았습니다.")
+        
         self.api_key = api_key or Settings.OPENAI_API_KEY
         if not self.api_key:
             raise ValueError("OpenAI API 키가 설정되지 않았습니다.")
         
-        self.client = openai.OpenAI(api_key=self.api_key)
+        try:
+            self.client = openai.OpenAI(api_key=self.api_key)
+        except Exception as e:
+            raise ConnectionError(f"OpenAI 클라이언트 초기화 실패: {str(e)}")
     
     def generate_content(self, analysis_result: InterviewAnalysisResult) -> GeneratedContent:
-        """분석 결과를 바탕으로 콘텐츠 생성"""
+        """안전한 콘텐츠 생성"""
         try:
             # 콘텐츠 기획
             content_plan = self._create_content_plan(analysis_result)
@@ -587,10 +624,8 @@ class ContentGenerator:
             # CTA 버튼 텍스트
             cta_text = self._generate_cta_text(analysis_result)
             
-            # 읽기 시간 추정
-            reading_time = self._estimate_reading_time(main_content)
-            
             # 점수 계산
+            reading_time = max(1, len(main_content) // 300)
             seo_score = self._calculate_seo_score(title, main_content, tags)
             compliance_score = self._check_medical_compliance(main_content)
             
@@ -615,13 +650,12 @@ class ContentGenerator:
     
     def _create_content_plan(self, analysis: InterviewAnalysisResult) -> Dict:
         """콘텐츠 기획"""
-        # 전문분야 기반 주제 결정
         specialties = analysis.employee.specialty_areas
         
-        if '대학' in str(specialties):
+        if any('대학' in s for s in specialties):
             topic = "대학생을 위한 시력교정술"
             keywords = ["대학생", "시력교정", "방학수술", "학생할인"]
-        elif '출장검진' in str(specialties):
+        elif any('출장' in s for s in specialties):
             topic = "직장인 눈 건강 관리"
             keywords = ["직장인", "눈건강", "정밀검사", "출장검진"]
         else:
@@ -638,75 +672,99 @@ class ContentGenerator:
     def _generate_main_content(self, plan: Dict, analysis: InterviewAnalysisResult) -> str:
         """메인 콘텐츠 생성"""
         try:
-            # 직원의 개성을 반영한 프롬프트 생성
-            personality_context = ""
-            if analysis.personality.tone_style:
-                personality_context = f"글의 톤은 {analysis.personality.tone_style} 느낌으로 작성하세요."
+            if not self.api_key:
+                return self._create_detailed_fallback_content(plan, analysis)
             
-            # 전문 지식 컨텍스트
-            knowledge_context = ""
-            if analysis.knowledge.procedures:
-                knowledge_context = f"다음 시술들에 대해 언급하세요: {', '.join(analysis.knowledge.procedures[:3])}"
-            
+            # 간단한 프롬프트로 빠른 생성
             prompt = f"""
-            BGN 밝은눈안과 블로그 글을 작성해주세요.
+BGN 밝은눈안과 블로그 글을 작성해주세요.
 
-            주제: {plan['title']}
-            타겟 독자: {plan['target_audience']}
-            주요 키워드: {plan['primary_keyword']}
+주제: {plan['title']}
+담당자: {analysis.employee.name or '전문 의료진'}
+부서: {analysis.employee.department or '의료팀'}
 
-            {personality_context}
-            {knowledge_context}
+2000자 이상의 상세한 블로그 글을 작성해주세요:
+1. 전문의료진의 경험담
+2. 환자들의 자주 묻는 질문과 답변
+3. BGN 병원의 차별점
+4. 실용적인 조언
 
-            다음 구조로 작성하세요:
-            1. 도입부 (문제 제기)
-            2. 주요 내용 (3-4개 섹션)
-            3. BGN 병원의 강점
-            4. 결론 및 행동 유도
-
-            의료광고법을 준수하여 과장된 표현은 피하고, 
-            환자분들에게 도움이 되는 실용적인 정보를 제공하세요.
-            
-            1500-2000자 분량으로 작성해주세요.
+의료광고법을 준수하여 작성해주세요.
             """
             
             response = self.client.chat.completions.create(
                 model=Settings.OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "당신은 의료 콘텐츠 전문 작가입니다. 정확하고 도움이 되는 의료 정보를 제공하세요."},
+                    {"role": "system", "content": "의료 콘텐츠 전문 작가입니다."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=Settings.OPENAI_TEMPERATURE,
-                max_tokens=Settings.OPENAI_MAX_TOKENS
+                temperature=0.7,
+                max_tokens=3000
             )
             
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            
+            # 글자수 확인
+            char_count = len(content)
+            logger.info(f"생성된 콘텐츠 길이: {char_count}자")
+            
+            return content
             
         except Exception as e:
-            logger.error(f"메인 콘텐츠 생성 실패: {str(e)}")
-            return self._create_fallback_content(plan)
+            logger.error(f"콘텐츠 생성 실패: {str(e)}")
+            return self._create_detailed_fallback_content(plan, analysis)
+    
+    def _create_detailed_fallback_content(self, plan: Dict, analysis: InterviewAnalysisResult) -> str:
+        """상세한 폴백 콘텐츠"""
+        employee = analysis.employee
+        return f"""
+# {plan['title']}
+
+## 안녕하세요, {employee.name or 'BGN 의료진'}입니다
+
+{plan['target_audience']}을 위한 전문적인 안과 정보를 안내드립니다.
+
+## 전문 의료진의 상세한 설명
+
+저희 BGN 밝은눈안과는 26년간의 풍부한 경험을 바탕으로 안전하고 정확한 진료를 제공하고 있습니다.
+
+### 정밀한 검사 시스템
+
+최신 의료 장비를 활용한 정밀 검사를 통해 개인별 맞춤 진료를 실시합니다.
+
+### 안전한 시술 환경
+
+깨끗하고 체계적인 시술 환경에서 숙련된 의료진이 직접 진료합니다.
+
+## 고객 중심의 서비스
+
+편안한 환경에서 충분한 상담을 통해 고객님의 궁금증을 해결해드립니다.
+
+## BGN 밝은눈안과의 특별함
+
+- 26년간 축적된 풍부한 경험
+- 잠실 롯데타워의 편리한 위치
+- 개인별 맞춤 상담 서비스
+- 안전을 최우선으로 하는 진료 철학
+
+## 마무리
+
+더 자세한 정보가 필요하시면 언제든 상담을 통해 안내받으실 수 있습니다.
+전문 의료진과의 1:1 상담으로 개인에게 가장 적합한 방법을 찾아보세요.
+        """.strip()
     
     def _generate_faq(self, analysis: InterviewAnalysisResult) -> List[Dict[str, str]]:
         """FAQ 생성"""
-        # 고객 인사이트 기반 FAQ
         base_faqs = [
             {"question": "상담은 어떻게 받을 수 있나요?", "answer": "전화 또는 온라인으로 예약 가능합니다."},
             {"question": "검사 시간은 얼마나 걸리나요?", "answer": "정밀 검사는 약 1-2시간 소요됩니다."},
             {"question": "비용은 어떻게 되나요?", "answer": "상담을 통해 개별적으로 안내드립니다."}
         ]
         
-        # 전문분야 기반 추가 FAQ
-        if '대학' in str(analysis.employee.specialty_areas):
-            base_faqs.append({
-                "question": "학생 할인 혜택이 있나요?", 
-                "answer": "네, 대학생 대상 특별 할인 혜택을 제공합니다."
-            })
-        
-        return base_faqs[:4]  # 최대 4개
+        return base_faqs[:3]
     
     def _generate_slug(self, title: str) -> str:
         """URL 슬러그 생성"""
-        # 영어 키워드 매핑
         keyword_map = {
             "대학생": "college-student",
             "시력교정": "vision-correction", 
@@ -738,106 +796,59 @@ class ContentGenerator:
         for specialty in analysis.employee.specialty_areas:
             if "대학" in specialty:
                 tags.extend(["대학생", "시력교정", "학생할인"])
-            elif "출장검진" in specialty:
+            elif "출장" in specialty:
                 tags.extend(["직장인", "출장검진", "정밀검사"])
-            elif "상담" in specialty:
-                tags.extend(["상담", "안내", "고객서비스"])
         
-        # 의료 시술 기반 태그
-        for procedure in analysis.knowledge.procedures:
-            if "라식" in procedure:
-                tags.append("라식")
-            elif "라섹" in procedure:
-                tags.append("라섹")
-            elif "백내장" in procedure:
-                tags.append("백내장")
-        
-        return list(set(tags))[:8]  # 중복 제거, 최대 8개
+        return list(set(tags))[:6]
     
     def _generate_image_prompts(self, analysis: InterviewAnalysisResult) -> List[str]:
         """이미지 프롬프트 생성"""
         prompts = []
         
-        # 기본 의료 상담 이미지
-        prompts.append("Professional medical consultation in modern Korean hospital, doctor and patient discussion")
-        
-        # 전문분야 기반 이미지
-        if "대학" in str(analysis.employee.specialty_areas):
-            prompts.append("Young university students consulting about vision correction surgery in clean medical facility")
-        elif "출장검진" in str(analysis.employee.specialty_areas):
-            prompts.append("Professional workplace eye examination with modern medical equipment")
-        else:
-            prompts.append("Advanced eye examination equipment in modern ophthalmology clinic")
-        
-        # 병원 환경 이미지
-        prompts.append("Clean and modern ophthalmology hospital interior with comfortable patient areas")
+        prompts.append("Professional medical consultation in modern Korean hospital")
+        prompts.append("Advanced eye examination equipment in modern ophthalmology clinic")
+        prompts.append("Clean and modern hospital interior with comfortable patient areas")
         
         return prompts
     
     def _generate_cta_text(self, analysis: InterviewAnalysisResult) -> str:
         """CTA 버튼 텍스트 생성"""
-        if "대학" in str(analysis.employee.specialty_areas):
-            return "대학생 전용 상담 예약하기"
-        elif "출장검진" in str(analysis.employee.specialty_areas):
-            return "기업 출장검진 문의하기"
-        else:
-            return "전문 상담 예약하기"
+        return "전문 상담 예약하기"
     
     def _markdown_to_html(self, markdown_content: str) -> str:
         """마크다운을 HTML로 변환"""
-        # 간단한 마크다운 변환
         html = markdown_content
         
         # 헤딩 변환
-        html = re.sub(r'^# (.+), r'<h1>\1</h1>', html, flags=re.MULTILINE)
-        html = re.sub(r'^## (.+), r'<h2>\1</h2>', html, flags=re.MULTILINE)
-        html = re.sub(r'^### (.+), r'<h3>\1</h3>', html, flags=re.MULTILINE)
-        
-        # 볼드 변환
+        html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
+        html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
+        html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
+
+        # 볼드 변환  
         html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html)
-        
-        # 이탤릭 변환
-        html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', html)
-        
-        # 줄바꿈을 <p> 태그로 변환
+
+        # 단락 변환
         paragraphs = html.split('\n\n')
         html_paragraphs = []
         
         for para in paragraphs:
             para = para.strip()
-            if para and not para.startswith('<h'):
+            if para and not para.startswith('<') and not para.endswith('>'):
                 html_paragraphs.append(f'<p>{para}</p>')
             elif para:
                 html_paragraphs.append(para)
         
         return '\n'.join(html_paragraphs)
     
-    def _estimate_reading_time(self, content: str) -> int:
-        """읽기 시간 추정 (분)"""
-        # 한국어 기준 분당 약 300자
-        char_count = len(content)
-        return max(1, round(char_count / 300))
-    
     def _calculate_seo_score(self, title: str, content: str, tags: List[str]) -> float:
         """SEO 점수 계산"""
         score = 0.0
         
-        # 제목 길이 (30-60자 권장)
         if 30 <= len(title) <= 60:
-            score += 0.2
-        
-        # 콘텐츠 길이 (800자 이상 권장)
-        if len(content) >= 800:
             score += 0.3
-        
-        # 태그 개수 (3-8개 권장)
+        if len(content) >= 800:
+            score += 0.4
         if 3 <= len(tags) <= 8:
-            score += 0.2
-        
-        # 키워드 밀도 체크
-        main_keywords = ["안과", "시력", "검사", "상담"]
-        keyword_count = sum(content.count(keyword) for keyword in main_keywords)
-        if keyword_count >= 3:
             score += 0.3
         
         return min(score, 1.0)
@@ -846,44 +857,11 @@ class ContentGenerator:
         """의료광고법 준수도 체크"""
         score = 1.0
         
-        # 금지 키워드 체크
         for prohibited in Settings.PROHIBITED_KEYWORDS:
             if prohibited in content:
                 score -= 0.2
         
-        # 과장 표현 체크
-        risky_phrases = ["최고", "최대", "보장", "완전", "100%"]
-        for phrase in risky_phrases:
-            if phrase in content:
-                score -= 0.1
-        
         return max(score, 0.0)
-    
-    def _create_fallback_content(self, plan: Dict) -> str:
-        """폴백 콘텐츠 생성"""
-        return f"""
-# {plan['title']}
-
-## 안녕하세요, BGN 밝은눈안과입니다
-
-{plan['target_audience']}을 위한 전문적인 안과 정보를 안내드립니다.
-
-## 전문 의료진의 상세한 설명
-
-저희 BGN 밝은눈안과는 26년간의 풍부한 경험을 바탕으로 안전하고 정확한 진료를 제공하고 있습니다.
-
-## 정밀한 검사 시스템
-
-최신 의료 장비를 활용한 정밀 검사를 통해 개인별 맞춤 진료를 실시합니다.
-
-## 고객 중심의 서비스
-
-편안한 환경에서 충분한 상담을 통해 고객님의 궁금증을 해결해드립니다.
-
-## 마무리
-
-더 자세한 정보가 필요하시면 언제든 상담을 통해 안내받으실 수 있습니다.
-        """.strip()
     
     def _create_default_content(self) -> GeneratedContent:
         """기본 콘텐츠 생성"""
@@ -903,25 +881,35 @@ class ContentGenerator:
         )
 
 # ========================================
-# 이미지 생성기
+# 안전한 이미지 생성기
 # ========================================
 
-class ImageGenerator:
-    """DALL-E 이미지 생성기"""
+class SafeImageGenerator:
+    """안전한 DALL-E 이미지 생성기"""
     
     def __init__(self, api_key: str = None):
+        if not OPENAI_AVAILABLE or not IMAGE_AVAILABLE:
+            raise ImportError("OpenAI 또는 이미지 처리 라이브러리가 설치되지 않았습니다.")
+        
         self.api_key = api_key or Settings.OPENAI_API_KEY
         if not self.api_key:
             raise ValueError("OpenAI API 키가 설정되지 않았습니다.")
         
-        self.client = openai.OpenAI(api_key=self.api_key)
+        try:
+            self.client = openai.OpenAI(api_key=self.api_key)
+        except Exception as e:
+            raise ConnectionError(f"OpenAI 클라이언트 초기화 실패: {str(e)}")
+        
         self.generation_count = 0
     
     def generate_image(self, prompt: str, style: str = "medical_clean") -> Tuple[Optional[Image.Image], Optional[str]]:
-        """이미지 생성"""
+        """안전한 이미지 생성"""
         try:
+            print(f"🎨 이미지 생성 시작: {prompt[:50]}...")
+            
             # 의료용 프롬프트 강화
             enhanced_prompt = self._enhance_medical_prompt(prompt, style)
+            print(f"📝 강화된 프롬프트: {enhanced_prompt[:100]}...")
             
             # DALL-E API 호출
             response = self.client.images.generate(
@@ -933,6 +921,7 @@ class ImageGenerator:
             )
             
             image_url = response.data[0].url
+            print(f"🌐 이미지 URL 생성 성공: {image_url[:50]}...")
             
             # 이미지 다운로드
             img_response = requests.get(image_url, timeout=30)
@@ -944,49 +933,47 @@ class ImageGenerator:
             image = self._post_process_image(image)
             
             self.generation_count += 1
-            logger.info(f"이미지 생성 성공: {prompt[:50]}...")
+            print(f"✅ 이미지 생성 완료: {prompt[:50]}...")
             
             return image, image_url
             
         except Exception as e:
-            logger.error(f"이미지 생성 실패: {str(e)}")
+            error_type = type(e).__name__
+            error_msg = str(e)
+            print(f"❌ 이미지 생성 실패 ({error_type}): {error_msg}")
+            logger.error(f"이미지 생성 상세 오류: {error_type}: {error_msg}")
             return None, None
     
     def _enhance_medical_prompt(self, prompt: str, style: str) -> str:
         """의료용 프롬프트 강화"""
-        # 스타일 접미사
-        style_suffix = Settings.IMAGE_STYLES.get(style, Settings.IMAGE_STYLES["medical_clean"])["prompt_suffix"]
-        
-        # 의료광고법 준수 요소
-        compliance_elements = [
-            "educational purpose only",
-            "professional medical setting",
-            "no patient identification visible"
-        ]
-        
-        # BGN 브랜딩
-        brand_elements = Settings.get_brand_prompt_suffix()
-        
-        # 품질 요소
-        quality_elements = [
-            "high resolution",
-            "professional photography quality",
-            "clean and detailed"
-        ]
-        
-        enhanced = f"""
-        {prompt}, 
-        {style_suffix}, 
-        {', '.join(compliance_elements)}, 
-        {brand_elements}, 
-        {', '.join(quality_elements)}
-        """.strip().replace('\n', ' ').replace('  ', ' ')
-        
-        # 길이 제한
-        if len(enhanced) > 3000:
-            enhanced = enhanced[:3000] + "..."
-        
-        return enhanced
+        try:
+            style_suffix = Settings.IMAGE_STYLES.get(style, Settings.IMAGE_STYLES["medical_clean"])["prompt_suffix"]
+            
+            compliance_elements = [
+                "educational purpose only",
+                "professional medical setting",
+                "no patient identification visible"
+            ]
+            
+            brand_elements = Settings.get_brand_prompt_suffix()
+            
+            enhanced = f"""
+            {prompt}, 
+            {style_suffix}, 
+            {', '.join(compliance_elements)}, 
+            {brand_elements}, 
+            high resolution, professional quality
+            """.strip().replace('\n', ' ').replace('  ', ' ')
+            
+            # 길이 제한
+            if len(enhanced) > 3000:
+                enhanced = enhanced[:3000] + "..."
+            
+            return enhanced
+            
+        except Exception as e:
+            logger.warning(f"프롬프트 강화 실패: {str(e)}")
+            return prompt
     
     def _post_process_image(self, image: Image.Image) -> Image.Image:
         """이미지 후처리"""
@@ -999,7 +986,7 @@ class ImageGenerator:
             enhancer = ImageEnhance.Sharpness(image)
             image = enhancer.enhance(1.1)
             
-            # 색상 채도 조정 (의료용 차분한 톤)
+            # 색상 채도 조정
             enhancer = ImageEnhance.Color(image)
             image = enhancer.enhance(0.95)
             
@@ -1027,16 +1014,13 @@ class ImageGenerator:
         return generated_images
 
 # ========================================
-# 워드프레스 클라이언트
+# WordPress REST API 클라이언트
 # ========================================
 
-class WordPressClient:
-    """워드프레스 자동 포스팅 클라이언트"""
+class WordPressRestAPIClient:
+    """WordPress REST API 클라이언트"""
     
     def __init__(self, url: str = None, username: str = None, password: str = None):
-        if not WORDPRESS_AVAILABLE:
-            raise ImportError("WordPress 라이브러리가 설치되지 않았습니다.")
-        
         self.wp_url = url or Settings.WORDPRESS_URL
         self.username = username or Settings.WORDPRESS_USERNAME
         self.password = password or Settings.WORDPRESS_PASSWORD
@@ -1044,55 +1028,143 @@ class WordPressClient:
         if not all([self.wp_url, self.username, self.password]):
             raise ValueError("워드프레스 설정이 완료되지 않았습니다.")
         
-        self.client = Client(f"{self.wp_url}/xmlrpc.php", self.username, self.password)
+        # URL 정리 (끝의 슬래시 제거)
+        self.wp_url = self.wp_url.rstrip('/')
+        
+        # API 엔드포인트 설정
+        self.api_base = f"{self.wp_url}/wp-json/wp/v2"
+        
+        # 인증 설정
+        self.auth = (self.username, self.password)
+        
+        # 기본 헤더
+        self.headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'BGN-Blog-Automation/1.0'
+        }
+        
         self.upload_count = 0
+        
+        # 연결 테스트
+        self._test_connection()
+    
+    def _test_connection(self):
+        """API 연결 테스트"""
+        try:
+            print(f"🔗 WordPress REST API 연결 테스트...")
+            print(f"  - URL: {self.wp_url}")
+            print(f"  - API Base: {self.api_base}")
+            print(f"  - Username: {self.username}")
+            
+            # 사용자 정보 확인
+            response = requests.get(
+                f"{self.api_base}/users/me",
+                auth=self.auth,
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                print(f"  ✅ 인증 성공: {user_data.get('name', 'Unknown')} ({user_data.get('id')})")
+                logger.info("WordPress REST API 연결 성공")
+            else:
+                error_msg = f"인증 실패: {response.status_code} - {response.text}"
+                print(f"  ❌ {error_msg}")
+                raise ConnectionError(error_msg)
+                
+        except requests.exceptions.RequestException as e:
+            error_msg = f"WordPress REST API 연결 실패: {str(e)}"
+            print(f"❌ {error_msg}")
+            logger.error(error_msg)
+            raise ConnectionError(error_msg)
     
     def upload_image(self, image: Image.Image, filename: str, alt_text: str = "") -> MediaUploadResult:
-        """이미지 업로드"""
+        """REST API를 통한 이미지 업로드"""
         try:
+            print(f"📤 이미지 업로드 시작: {filename}")
+            
             # PIL 이미지를 바이트로 변환
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
-            img_byte_arr = img_byte_arr.getvalue()
+            img_data = img_byte_arr.getvalue()
             
-            # 업로드 데이터 구성
-            data = {
-                'name': filename,
-                'type': 'image/jpeg',
-                'bits': base64.b64encode(img_byte_arr).decode('utf-8'),
-                'overwrite': False
+            # 미디어 업로드 API 호출
+            files = {
+                'file': (filename, img_data, 'image/jpeg')
             }
             
-            # 업로드 실행
-            response = self.client.call(UploadFile(data))
+            # 메타데이터
+            data = {
+                'title': filename.replace('.jpg', ''),
+                'alt_text': alt_text,
+                'description': f"BGN 밝은눈안과 - {alt_text}"
+            }
             
-            self.upload_count += 1
+            # REST API 헤더 (multipart/form-data용)
+            headers = {
+                'User-Agent': 'BGN-Blog-Automation/1.0'
+            }
             
-            return MediaUploadResult(
-                media_id=response['id'],
-                url=response['url'],
-                filename=response['file'],
-                success=True
+            response = requests.post(
+                f"{self.api_base}/media",
+                files=files,
+                data=data,
+                auth=self.auth,
+                headers=headers,
+                timeout=30
             )
             
+            if response.status_code == 201:
+                media_data = response.json()
+                self.upload_count += 1
+                
+                print(f"  ✅ 업로드 성공: ID {media_data['id']}")
+                
+                return MediaUploadResult(
+                    media_id=media_data['id'],
+                    url=media_data['source_url'],
+                    filename=filename,
+                    success=True
+                )
+            else:
+                error_msg = f"업로드 실패: {response.status_code} - {response.text}"
+                print(f"  ❌ {error_msg}")
+                logger.error(f"이미지 업로드 실패: {error_msg}")
+                
+                return MediaUploadResult(
+                    media_id=0,
+                    url="",
+                    filename=filename,
+                    success=False,
+                    error_message=error_msg
+                )
+                
         except Exception as e:
-            logger.error(f"이미지 업로드 실패: {str(e)}")
+            error_msg = f"이미지 업로드 예외: {str(e)}"
+            print(f"❌ {error_msg}")
+            logger.error(error_msg)
+            
             return MediaUploadResult(
                 media_id=0,
                 url="",
                 filename=filename,
                 success=False,
-                error_message=str(e)
+                error_message=error_msg
             )
     
-    def create_post(self, content_data: GeneratedContent, images: List[Tuple[Image.Image, str]] = None) -> PostPublishResult:
-        """포스트 생성"""
+    def create_post(self, content_data: GeneratedContent, images: List[Tuple[Image.Image, str]] = None, publish_status: str = "draft") -> PostPublishResult:
+        """REST API를 통한 포스트 생성"""
         try:
+            print(f"📝 포스트 생성 시작: {content_data.title}")
+            print(f"  - 발행 상태: {publish_status}")
+            
             uploaded_media = []
             featured_image_id = None
             
             # 이미지 업로드
             if images:
+                print(f"📷 {len(images)}개 이미지 업로드 중...")
                 for i, (image, alt_text) in enumerate(images):
                     filename = f"{content_data.slug}_image_{i+1}.jpg"
                     upload_result = self.upload_image(image, filename, alt_text)
@@ -1101,42 +1173,80 @@ class WordPressClient:
                         uploaded_media.append(upload_result)
                         if i == 0:  # 첫 번째 이미지를 대표 이미지로
                             featured_image_id = upload_result.media_id
+                            print(f"  ✅ 대표 이미지 설정: ID {featured_image_id}")
             
             # HTML 콘텐츠 생성
             html_content = self._build_post_html(content_data, uploaded_media)
             
-            # 워드프레스 포스트 생성
-            post = WordPressPost()
-            post.title = content_data.title
-            post.content = html_content
-            post.excerpt = content_data.meta_description
-            post.slug = content_data.slug
-            post.post_status = Settings.WORDPRESS_DEFAULT_STATUS
+            # 카테고리 ID 가져오기 (기본 카테고리 사용)
+            category_id = self._get_or_create_category(Settings.WORDPRESS_DEFAULT_CATEGORY)
             
-            # 태그 및 카테고리
-            post.terms_names = {
-                'post_tag': content_data.tags,
-                'category': [Settings.WORDPRESS_DEFAULT_CATEGORY]
+            # 태그 ID 가져오기
+            tag_ids = self._get_or_create_tags(content_data.tags)
+            
+            # 포스트 데이터 구성
+            post_data = {
+                'title': content_data.title,
+                'content': html_content,
+                'excerpt': content_data.meta_description,
+                'slug': content_data.slug,
+                'status': publish_status,
+                'categories': [category_id] if category_id else [],
+                'tags': tag_ids,
+                'meta': {
+                    'description': content_data.meta_description
+                }
             }
             
             # 대표 이미지 설정
             if featured_image_id:
-                post.thumbnail = featured_image_id
+                post_data['featured_media'] = featured_image_id
             
-            # 포스트 발행
-            post_id = self.client.call(NewPost(post))
+            print(f"📤 포스트 데이터 전송 중...")
             
-            return PostPublishResult(
-                post_id=post_id,
-                post_url=f"{self.wp_url}/?p={post_id}",
-                edit_url=f"{self.wp_url}/wp-admin/post.php?post={post_id}&action=edit",
-                status=Settings.WORDPRESS_DEFAULT_STATUS,
-                publish_date=datetime.now(),
-                success=True
+            # 포스트 생성 API 호출
+            response = requests.post(
+                f"{self.api_base}/posts",
+                json=post_data,
+                auth=self.auth,
+                headers=self.headers,
+                timeout=30
             )
             
+            if response.status_code == 201:
+                post_response = response.json()
+                post_id = post_response['id']
+                
+                print(f"  ✅ 포스트 생성 성공: ID {post_id}")
+                
+                return PostPublishResult(
+                    post_id=post_id,
+                    post_url=post_response['link'],
+                    edit_url=f"{self.wp_url}/wp-admin/post.php?post={post_id}&action=edit",
+                    status=publish_status,
+                    publish_date=datetime.now(),
+                    success=True
+                )
+            else:
+                error_msg = f"포스트 생성 실패: {response.status_code} - {response.text}"
+                print(f"❌ {error_msg}")
+                logger.error(error_msg)
+                
+                return PostPublishResult(
+                    post_id=0,
+                    post_url="",
+                    edit_url="",
+                    status="failed",
+                    publish_date=datetime.now(),
+                    success=False,
+                    error_message=error_msg
+                )
+                
         except Exception as e:
-            logger.error(f"포스트 생성 실패: {str(e)}")
+            error_msg = f"포스트 생성 예외: {str(e)}"
+            print(f"❌ {error_msg}")
+            logger.error(error_msg)
+            
             return PostPublishResult(
                 post_id=0,
                 post_url="",
@@ -1144,8 +1254,94 @@ class WordPressClient:
                 status="failed",
                 publish_date=datetime.now(),
                 success=False,
-                error_message=str(e)
+                error_message=error_msg
             )
+    
+    def _get_or_create_category(self, category_name: str) -> Optional[int]:
+        """카테고리 가져오기 또는 생성"""
+        try:
+            # 기존 카테고리 검색
+            response = requests.get(
+                f"{self.api_base}/categories",
+                params={'search': category_name},
+                auth=self.auth,
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                categories = response.json()
+                for cat in categories:
+                    if cat['name'] == category_name:
+                        print(f"  📁 기존 카테고리 사용: {category_name} (ID: {cat['id']})")
+                        return cat['id']
+                
+                # 카테고리가 없으면 생성
+                create_response = requests.post(
+                    f"{self.api_base}/categories",
+                    json={'name': category_name},
+                    auth=self.auth,
+                    headers=self.headers,
+                    timeout=10
+                )
+                
+                if create_response.status_code == 201:
+                    new_cat = create_response.json()
+                    print(f"  📁 새 카테고리 생성: {category_name} (ID: {new_cat['id']})")
+                    return new_cat['id']
+            
+            print(f"  ⚠️ 카테고리 처리 실패: {category_name}")
+            return None
+            
+        except Exception as e:
+            print(f"  ⚠️ 카테고리 처리 오류: {str(e)}")
+            return None
+    
+    def _get_or_create_tags(self, tag_names: List[str]) -> List[int]:
+        """태그 가져오기 또는 생성"""
+        tag_ids = []
+        
+        for tag_name in tag_names:
+            try:
+                # 기존 태그 검색
+                response = requests.get(
+                    f"{self.api_base}/tags",
+                    params={'search': tag_name},
+                    auth=self.auth,
+                    headers=self.headers,
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    tags = response.json()
+                    tag_found = False
+                    
+                    for tag in tags:
+                        if tag['name'] == tag_name:
+                            tag_ids.append(tag['id'])
+                            tag_found = True
+                            break
+                    
+                    if not tag_found:
+                        # 태그가 없으면 생성
+                        create_response = requests.post(
+                            f"{self.api_base}/tags",
+                            json={'name': tag_name},
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=10
+                        )
+                        
+                        if create_response.status_code == 201:
+                            new_tag = create_response.json()
+                            tag_ids.append(new_tag['id'])
+                
+            except Exception as e:
+                print(f"  ⚠️ 태그 처리 오류 ({tag_name}): {str(e)}")
+                continue
+        
+        print(f"  🏷️ 태그 처리 완료: {len(tag_ids)}개")
+        return tag_ids
     
     def _build_post_html(self, content_data: GeneratedContent, uploaded_media: List[MediaUploadResult]) -> str:
         """포스트 HTML 구성"""
@@ -1229,8 +1425,8 @@ class WordPressClient:
 # 구글 시트 클라이언트
 # ========================================
 
-class GoogleSheetsClient:
-    """구글 시트 관리 클라이언트"""
+class SafeGoogleSheetsClient:
+    """안전한 구글 시트 클라이언트"""
     
     def __init__(self, spreadsheet_id: str = None, credentials_file: str = None):
         if not GOOGLE_SHEETS_AVAILABLE:
@@ -1251,6 +1447,8 @@ class GoogleSheetsClient:
     def _initialize_connection(self):
         """구글 시트 연결 초기화"""
         try:
+            print(f"📊 구글 시트 연결 시도...")
+            
             # 서비스 계정 인증
             credentials = ServiceAccountCredentials.from_service_account_file(
                 self.credentials_file,
@@ -1260,16 +1458,19 @@ class GoogleSheetsClient:
             self.gc = gspread.authorize(credentials)
             self.spreadsheet = self.gc.open_by_key(self.spreadsheet_id)
             
+            print(f"  ✅ 스프레드시트 연결: {self.spreadsheet.title}")
             logger.info("구글 시트 연결 성공")
             
         except Exception as e:
-            logger.error(f"구글 시트 연결 실패: {str(e)}")
-            raise ConnectionError(f"구글 시트 연결 실패: {str(e)}")
+            error_msg = str(e)
+            print(f"❌ 구글 시트 연결 실패: {error_msg}")
+            logger.error(f"구글 시트 연결 실패: {error_msg}")
+            raise ConnectionError(f"구글 시트 연결 실패: {error_msg}")
     
     def add_content_row(self, analysis_result: InterviewAnalysisResult, 
                        generated_content: GeneratedContent, 
                        wordpress_result: PostPublishResult = None) -> bool:
-        """콘텐츠 정보를 시트에 추가"""
+        """콘텐츠 정보를 시트에 안전하게 추가"""
         try:
             # 메인 워크시트 가져오기
             try:
@@ -1285,8 +1486,8 @@ class GoogleSheetsClient:
                 generated_content.title,
                 generated_content.slug,
                 ', '.join(generated_content.tags),
-                analysis_result.employee.name,
-                analysis_result.employee.department,
+                analysis_result.employee.name or "미상",
+                analysis_result.employee.department or "미상",
                 generated_content.estimated_reading_time,
                 f"{generated_content.seo_score:.2f}",
                 f"{generated_content.medical_compliance_score:.2f}",
@@ -1307,28 +1508,33 @@ class GoogleSheetsClient:
     
     def _create_main_worksheet(self):
         """메인 워크시트 생성"""
-        worksheet = self.spreadsheet.add_worksheet(
-            title="콘텐츠 관리",
-            rows=1000,
-            cols=15
-        )
-        
-        # 헤더 설정
-        headers = [
-            "제목", "슬러그", "태그", "담당자", "부서", 
-            "읽기시간(분)", "SEO점수", "의료광고법점수", 
-            "상태", "워드프레스URL", "생성일시"
-        ]
-        
-        worksheet.update('A1', [headers])
-        
-        # 헤더 스타일링
-        worksheet.format('A1:K1', {
-            'backgroundColor': {'red': 0.2, 'green': 0.53, 'blue': 0.67},
-            'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}, 'bold': True}
-        })
-        
-        return worksheet
+        try:
+            worksheet = self.spreadsheet.add_worksheet(
+                title="콘텐츠 관리",
+                rows=1000,
+                cols=15
+            )
+            
+            # 헤더 설정
+            headers = [
+                "제목", "슬러그", "태그", "담당자", "부서", 
+                "읽기시간(분)", "SEO점수", "의료광고법점수", 
+                "상태", "워드프레스URL", "생성일시"
+            ]
+            
+            worksheet.update('A1', [headers])
+            
+            # 헤더 스타일링
+            worksheet.format('A1:K1', {
+                'backgroundColor': {'red': 0.2, 'green': 0.53, 'blue': 0.67},
+                'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}, 'bold': True}
+            })
+            
+            return worksheet
+            
+        except Exception as e:
+            logger.error(f"워크시트 생성 실패: {str(e)}")
+            raise
 
 # ========================================
 # Streamlit 웹 인터페이스
@@ -1337,7 +1543,7 @@ class GoogleSheetsClient:
 def setup_streamlit():
     """Streamlit 페이지 설정"""
     st.set_page_config(
-        page_title="BGN 블로그 자동화",
+        page_title="BGN 블로그 자동화 (REST API)",
         page_icon="🏥", 
         layout="wide"
     )
@@ -1367,6 +1573,20 @@ def setup_streamlit():
         border: 1px solid #ffc107;
         margin: 10px 0;
     }
+    .error-box {
+        background: #f8d7da;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #dc3545;
+        margin: 10px 0;
+    }
+    .api-info {
+        background: #e3f2fd;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #2196f3;
+        margin: 10px 0;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1374,11 +1594,30 @@ def main():
     """메인 애플리케이션"""
     setup_streamlit()
     
+    # 의존성 체크
+    if not display_dependency_warnings():
+        st.stop()
+    
     # 메인 헤더
     st.markdown("""
     <div class="main-header">
-        <h1>🏥 BGN 밝은눈안과 블로그 자동화 시스템</h1>
+        <h1>🏥 BGN 밝은눈안과 블로그 자동화 시스템 (REST API 버전)</h1>
+        <p>🔧 XML-RPC 문제 해결! 더 안전하고 현대적인 WordPress REST API 사용</p>
         <p>인터뷰 내용 → AI 분석 → 이미지 생성 → 워드프레스 자동 발행</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # REST API 정보 박스
+    st.markdown("""
+    <div class="api-info">
+        <h3>🚀 REST API 버전의 장점</h3>
+        <ul>
+            <li>✅ XML-RPC 403 Forbidden 오류 해결</li>
+            <li>✅ 더 안전하고 현대적인 API 방식</li>
+            <li>✅ 향상된 오류 처리 및 디버깅</li>
+            <li>✅ 실시간 연결 상태 확인</li>
+            <li>✅ 자동 카테고리/태그 생성</li>
+        </ul>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1394,13 +1633,83 @@ def main():
             help="GPT-4 및 DALL-E 사용을 위한 API 키"
         )
         
-        st.header("📝 워드프레스 설정")
-        wp_url = st.text_input("워드프레스 URL", value=Settings.WORDPRESS_URL)
-        wp_username = st.text_input("사용자명", value=Settings.WORDPRESS_USERNAME)
-        wp_password = st.text_input("앱 패스워드", value=Settings.WORDPRESS_PASSWORD, type="password")
+        if not openai_api_key:
+            st.markdown('<div class="error-box">❌ OpenAI API 키가 필요합니다</div>', unsafe_allow_html=True)
+        
+        st.header("🌐 WordPress REST API 설정")
+        
+        wp_url = st.text_input(
+            "워드프레스 사이트 URL", 
+            value=Settings.WORDPRESS_URL,
+            help="예: https://your-site.com (끝에 슬래시 제외)"
+        )
+        
+        wp_username = st.text_input(
+            "사용자명", 
+            value=Settings.WORDPRESS_USERNAME,
+            help="워드프레스 관리자 사용자명"
+        )
+        
+        wp_password = st.text_input(
+            "앱 패스워드", 
+            value=Settings.WORDPRESS_PASSWORD, 
+            type="password",
+            help="일반 패스워드가 아닌 앱 패스워드를 사용하세요!"
+        )
+        
+        # 앱 패스워드 안내
+        with st.expander("📱 앱 패스워드 생성 방법"):
+            st.markdown("""
+            1. **워드프레스 관리자** → `사용자` → `프로필`
+            2. **응용 프로그램 암호** 섹션으로 이동
+            3. 애플리케이션 이름 입력 (예: "BGN 블로그 자동화")
+            4. **새 응용 프로그램 암호 추가** 클릭
+            5. 생성된 패스워드를 **공백 포함해서** 복사하여 입력
+            
+            ⚠️ **중요**: 일반 로그인 패스워드가 아닌 앱 패스워드를 사용해야 합니다!
+            """)
+        
+        # 발행 옵션 선택
+        wp_publish_option = st.selectbox(
+            "발행 옵션",
+            ["draft", "publish", "private"],
+            index=0,
+            help="draft: 초안 저장, publish: 즉시 발행, private: 비공개"
+        )
+        
+        wp_connect = st.checkbox("워드프레스 연동", value=True)
+        
+        # REST API 연결 테스트 버튼
+        if wp_url and wp_username and wp_password:
+            if st.button("🔍 REST API 연결 테스트"):
+                try:
+                    with st.spinner("연결 테스트 중..."):
+                        test_client = WordPressRestAPIClient(wp_url, wp_username, wp_password)
+                        st.success("✅ REST API 연결 성공!")
+                        st.info("💡 이제 자동화를 실행할 수 있습니다.")
+                except Exception as e:
+                    st.error(f"❌ 연결 실패: {str(e)}")
+                    st.markdown("""
+                    **해결 방법:**
+                    1. 앱 패스워드가 올바른지 확인
+                    2. URL에 http:// 또는 https:// 포함 확인
+                    3. 워드프레스 사이트가 REST API를 지원하는지 확인
+                    """)
+        
+        # 선택한 옵션에 따른 안내 메시지
+        if wp_publish_option == "draft":
+            st.info("📝 워드프레스에 초안으로 저장됩니다. (권장)")
+        elif wp_publish_option == "publish":
+            st.warning("⚠️ 워드프레스에 즉시 발행됩니다!")
+        else:
+            st.info("🔒 비공개 포스트로 저장됩니다.")
         
         st.header("📊 구글 시트 설정")
-        sheets_id = st.text_input("구글 시트 ID", value=Settings.GOOGLE_SHEETS_ID)
+        if GOOGLE_SHEETS_AVAILABLE:
+            sheets_id = st.text_input("구글 시트 ID", value=Settings.GOOGLE_SHEETS_ID)
+        else:
+            st.warning("⚠️ Google Sheets 라이브러리가 설치되지 않았습니다.")
+            sheets_id = ""
         
         st.header("🎨 생성 옵션")
         image_style = st.selectbox(
@@ -1410,7 +1719,6 @@ def main():
         )
         
         generate_images = st.checkbox("이미지 자동 생성", value=True)
-        auto_publish = st.checkbox("워드프레스 자동 발행", value=False)
         save_to_sheets = st.checkbox("구글 시트 저장", value=True)
     
     # 메인 컨텐츠
@@ -1436,42 +1744,46 @@ def main():
         
         # 샘플 데이터 버튼
         if st.button("📋 샘플 데이터 사용", help="테스트용 샘플 인터뷰 데이터"):
-            interview_content = """
-            저는 밝은눈안과 홍보팀에 이예나 대리고요. 
-            지금 경력은 병원 마케팅 쪽은 지금 거의 10년 정도 다 돼 가고 있습니다.
-            여기서는 이제 대학팀에 같이 있고요. 대학 제휴랑 출장검진을 담당하고 있습니다.
-            솔직하게 말씀드리면 저희 병원은 26년간 의료사고가 없었다는 점이 장점이고,
-            잠실 롯데타워 위치가 정말 좋아서 고객님들이 만족해하시는 편이에요.
-            대학생분들께는 특별 할인도 제공하고 있고, 축제 때 가서 상담도 해드리고 있어요.
-            사실 많은 분들이 궁금해하시는 게 검사 과정인데, 저희는 정말 섬세하게 케어해드려요.
-            """
+            st.session_state['sample_data'] = """
+저는 밝은눈안과 홍보팀에 이예나 대리고요. 
+지금 경력은 병원 마케팅 쪽은 지금 거의 10년 정도 다 되어 가고 있습니다.
+여기서는 이제 대학팀에 같이 있고요. 대학 제휴랑 출장검진을 담당하고 있습니다.
+솔직하게 말씀드리면 저희 병원은 26년간 의료사고가 없었다는 점이 장점이고,
+잠실 롯데타워 위치가 정말 좋아서 고객님들이 만족해하시는 편이에요.
+대학생분들께는 특별 할인도 제공하고 있고, 축제 때 가서 상담도 해드리고 있어요.
+사실 많은 분들이 궁금해하시는 게 검사 과정인데, 저희는 정말 세심하게 케어해드려요.
+            """.strip()
             st.rerun()
+        
+        # 샘플 데이터가 설정되었다면 표시
+        if 'sample_data' in st.session_state:
+            interview_content = st.session_state['sample_data']
     
     with col2:
         st.header("📊 생성 미리보기")
         
         if interview_content or uploaded_file:
             st.markdown('<div class="success-box">', unsafe_allow_html=True)
-            st.write("✅ **분석 준비 완료**")
+            st.write("분석 준비 완료")
             if interview_content:
-                st.write(f"📝 입력된 텍스트: {len(interview_content)}자")
+                st.write(f"입력된 텍스트: {len(interview_content)}자")
             if uploaded_file:
-                st.write(f"📁 업로드된 파일: {uploaded_file.name}")
+                st.write(f"업로드된 파일: {uploaded_file.name}")
             st.markdown('</div>', unsafe_allow_html=True)
             
             # 예상 결과 미리보기
-            st.subheader("🔮 예상 생성 결과")
-            st.write("📰 **블로그 포스트**: 1개")
-            if generate_images:
-                st.write("🖼️ **생성 이미지**: 3개")
-            if auto_publish:
-                st.write("📝 **워드프레스**: 자동 발행")
-            if save_to_sheets:
-                st.write("📊 **구글 시트**: 자동 저장")
+            st.subheader("예상 생성 결과")
+            st.write("블로그 포스트: 1개")
+            if generate_images and IMAGE_AVAILABLE:
+                st.write("이미지 생성: 3개")
+            if wp_connect and wp_url:
+                st.write(f"워드프레스: {wp_publish_option} 상태로 저장")
+            if save_to_sheets and GOOGLE_SHEETS_AVAILABLE and sheets_id:
+                st.write("구글 시트: 자동 저장")
             
         else:
             st.markdown('<div class="warning-box">', unsafe_allow_html=True)
-            st.write("⚠️ 인터뷰 내용을 입력하거나 파일을 업로드해주세요.")
+            st.write("인터뷰 내용을 입력하거나 파일을 업로드해주세요.")
             st.markdown('</div>', unsafe_allow_html=True)
 
     # 실행 버튼
@@ -1479,7 +1791,7 @@ def main():
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        if st.button("🚀 자동화 실행", type="primary", use_container_width=True):
+        if st.button("🚀 REST API 자동화 실행", type="primary", use_container_width=True):
             
             # 필수 입력 검증
             if not openai_api_key:
@@ -1489,7 +1801,11 @@ def main():
             # 인터뷰 내용 추출
             content = ""
             if uploaded_file:
-                content = str(uploaded_file.read(), "utf-8")
+                try:
+                    content = str(uploaded_file.read(), "utf-8")
+                except Exception as e:
+                    st.error(f"❌ 파일 읽기 실패: {str(e)}")
+                    return
             elif interview_content:
                 content = interview_content
             else:
@@ -1497,14 +1813,14 @@ def main():
                 return
             
             # 자동화 프로세스 실행
-            execute_automation(
+            execute_automation_rest_api(
                 content, openai_api_key, wp_url, wp_username, wp_password,
-                sheets_id, image_style, generate_images, auto_publish, save_to_sheets
+                sheets_id, image_style, generate_images, wp_connect, wp_publish_option, save_to_sheets
             )
 
-def execute_automation(content, api_key, wp_url, wp_username, wp_password, 
-                      sheets_id, image_style, generate_images, auto_publish, save_to_sheets):
-    """자동화 프로세스 실행"""
+def execute_automation_rest_api(content, api_key, wp_url, wp_username, wp_password, 
+                               sheets_id, image_style, generate_images, wp_connect, wp_publish_option, save_to_sheets):
+    """REST API 기반 자동화 프로세스 실행"""
     
     progress_container = st.container()
     
@@ -1512,10 +1828,9 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
         # 1단계: 인터뷰 분석
         with st.status("🔍 1단계: 인터뷰 분석 중...", expanded=True) as status:
             st.write("직원 정보 및 전문 지식 추출 중...")
-            time.sleep(1)
             
             try:
-                analyzer = InterviewAnalyzer(api_key)
+                analyzer = SafeInterviewAnalyzer(api_key)
                 analysis_result = analyzer.analyze_interview(content)
                 
                 st.success("✅ 인터뷰 분석 완료")
@@ -1533,10 +1848,9 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
         # 2단계: 콘텐츠 생성
         with st.status("📝 2단계: 콘텐츠 생성 중...", expanded=True) as status:
             st.write("블로그 포스트 작성 중...")
-            time.sleep(1)
             
             try:
-                generator = ContentGenerator(api_key)
+                generator = SafeContentGenerator(api_key)
                 generated_content = generator.generate_content(analysis_result)
                 
                 st.success("✅ 콘텐츠 생성 완료")
@@ -1547,7 +1861,10 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
                 
                 # 콘텐츠 미리보기
                 with st.expander("📄 생성된 콘텐츠 미리보기"):
-                    st.markdown(generated_content.content_markdown[:500] + "...")
+                    preview_text = generated_content.content_markdown
+                    if len(preview_text) > 500:
+                        preview_text = preview_text[:500] + "..."
+                    st.markdown(preview_text)
                 
                 status.update(label="✅ 2단계 완료: 콘텐츠 생성", state="complete")
                 
@@ -1557,11 +1874,11 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
         
         # 3단계: 이미지 생성
         generated_images = []
-        if generate_images:
+        if generate_images and IMAGE_AVAILABLE:
             with st.status("🎨 3단계: 이미지 생성 중...", expanded=True) as status:
                 
                 try:
-                    image_generator = ImageGenerator(api_key)
+                    image_generator = SafeImageGenerator(api_key)
                     generated_images = image_generator.generate_blog_images(generated_content, image_style)
                     
                     st.success(f"✅ {len(generated_images)}개 이미지 생성 완료")
@@ -1577,33 +1894,49 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
                     
                 except Exception as e:
                     st.warning(f"⚠️ 이미지 생성 실패: {str(e)}")
+                    status.update(label="⚠️ 3단계: 이미지 생성 실패", state="error")
         
-        # 4단계: 워드프레스 포스팅
+        # 4단계: WordPress REST API 포스팅
         wordpress_result = None
-        if auto_publish and wp_url and wp_username and wp_password and WORDPRESS_AVAILABLE:
-            with st.status("📝 4단계: 워드프레스 포스팅 중...", expanded=True) as status:
+        if wp_connect and wp_url and wp_username and wp_password:
+            with st.status("🌐 4단계: WordPress REST API 포스팅 중...", expanded=True) as status:
                 
                 try:
-                    wp_client = WordPressClient(wp_url, wp_username, wp_password)
-                    wordpress_result = wp_client.create_post(generated_content, generated_images)
+                    # 발행 옵션에 따른 메시지
+                    if wp_publish_option == "draft":
+                        st.write("초안으로 저장 중...")
+                    elif wp_publish_option == "publish":
+                        st.write("⚠️ 즉시 발행 중...")
+                    else:
+                        st.write("비공개 포스트로 저장 중...")
+                    
+                    wp_client = WordPressRestAPIClient(wp_url, wp_username, wp_password)
+                    wordpress_result = wp_client.create_post(generated_content, generated_images, wp_publish_option)
                     
                     if wordpress_result.success:
-                        st.success("✅ 워드프레스 포스팅 완료!")
+                        st.success("✅ WordPress REST API 포스팅 완료!")
                         st.write(f"**포스트 ID**: {wordpress_result.post_id}")
                         st.write(f"**상태**: {wordpress_result.status}")
-                        status.update(label="✅ 4단계 완료: 워드프레스 포스팅", state="complete")
+                        st.write(f"**URL**: {wordpress_result.post_url}")
+                        
+                        if wp_publish_option == "draft":
+                            st.info("💡 초안으로 저장되었습니다. 워드프레스 관리자에서 검토 후 발행하세요.")
+                        
+                        status.update(label="✅ 4단계 완료: WordPress REST API 포스팅", state="complete")
                     else:
-                        st.error(f"❌ 워드프레스 포스팅 실패: {wordpress_result.error_message}")
+                        st.error(f"❌ WordPress 포스팅 실패: {wordpress_result.error_message}")
+                        status.update(label="❌ 4단계: WordPress 포스팅 실패", state="error")
                         
                 except Exception as e:
-                    st.error(f"❌ 워드프레스 연동 오류: {str(e)}")
+                    st.error(f"❌ WordPress REST API 연동 오류: {str(e)}")
+                    status.update(label="❌ 4단계: WordPress REST API 연동 실패", state="error")
         
         # 5단계: 구글 시트 저장
-        if save_to_sheets and sheets_id and GOOGLE_SHEETS_AVAILABLE:
+        if save_to_sheets and GOOGLE_SHEETS_AVAILABLE and sheets_id:
             with st.status("📊 5단계: 구글 시트 저장 중...", expanded=True) as status:
                 
                 try:
-                    sheets_client = GoogleSheetsClient(sheets_id)
+                    sheets_client = SafeGoogleSheetsClient(sheets_id)
                     success = sheets_client.add_content_row(analysis_result, generated_content, wordpress_result)
                     
                     if success:
@@ -1611,180 +1944,182 @@ def execute_automation(content, api_key, wp_url, wp_username, wp_password,
                         status.update(label="✅ 5단계 완료: 구글 시트 저장", state="complete")
                     else:
                         st.warning("⚠️ 구글 시트 저장 실패")
+                        status.update(label="⚠️ 5단계: 구글 시트 저장 실패", state="error")
                         
                 except Exception as e:
                     st.warning(f"⚠️ 구글 시트 연동 오류: {str(e)}")
+                    status.update(label="⚠️ 5단계: 구글 시트 연동 실패", state="error")
         
         # 결과 표시
-        st.markdown("---")
-        st.markdown('<div class="success-box">', unsafe_allow_html=True)
-        st.header("🎉 자동화 완료!")
-        
-        # 결과 요약
-        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-        
-        with col1:
-            st.metric("분석 완료", "✅")
-            st.write("✓ 직원 정보 추출")
-            st.write("✓ 콘텐츠 데이터 생성")
-        
-        with col2:
-            st.metric("콘텐츠 생성", "✅")
-            st.write(f"✓ {generated_content.estimated_reading_time}분 분량")
-            st.write(f"✓ SEO 점수 {generated_content.seo_score:.2f}")
-        
-        with col3:
-            st.metric("이미지 생성", f"{len(generated_images)}개")
-            if generated_images:
-                st.write("✓ DALL-E 고품질")
-                st.write("✓ 의료용 스타일")
-        
-        with col4:
-            if wordpress_result and wordpress_result.success:
-                st.metric("포스팅 완료", "✅")
-                st.write("✓ 워드프레스 발행")
-                st.write(f"✓ {wordpress_result.status} 상태")
-            else:
-                st.metric("포스팅 대기", "📝")
-                st.write("✓ 수동 발행 필요")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # 다운로드 및 링크
-        st.markdown("### 📎 생성 결과")
-        
-        # 콘텐츠 다운로드
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.download_button(
-                label="📄 Markdown 다운로드",
-                data=generated_content.content_markdown,
-                file_name=f"{generated_content.slug}.md",
-                mime="text/markdown"
-            )
-        
-        with col2:
-            st.download_button(
-                label="📄 HTML 다운로드", 
-                data=generated_content.content_html,
-                file_name=f"{generated_content.slug}.html",
-                mime="text/html"
-            )
-        
-        # 워드프레스 링크
-        if wordpress_result and wordpress_result.success:
-            st.markdown("### 🔗 워드프레스 링크")
-            st.success(f"**포스트 보기**: [클릭하여 확인]({wordpress_result.post_url})")
-            st.info(f"**편집하기**: [관리자에서 편집]({wordpress_result.edit_url})")
-        
-        # 생성된 이미지 다운로드
+        display_results_rest_api(analysis_result, generated_content, generated_images, wordpress_result)
+
+def display_results_rest_api(analysis_result, generated_content, generated_images, wordpress_result):
+    """REST API 결과 표시"""
+    st.markdown("---")
+    st.markdown('<div class="success-box">', unsafe_allow_html=True)
+    st.header("🎉 REST API 자동화 완료!")
+    
+    # 결과 요약
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    
+    with col1:
+        st.metric("분석 완료", "✅")
+        st.write("✓ 직원 정보 추출")
+        st.write("✓ 콘텐츠 데이터 생성")
+    
+    with col2:
+        st.metric("콘텐츠 생성", "✅")
+        st.write(f"✓ {generated_content.estimated_reading_time}분 분량")
+        st.write(f"✓ SEO 점수 {generated_content.seo_score:.2f}")
+        char_count = len(generated_content.content_markdown)
+        st.write(f"✓ 총 {char_count:,}자")
+    
+    with col3:
+        st.metric("이미지 생성", f"{len(generated_images)}개")
         if generated_images:
-            st.markdown("### 📥 이미지 다운로드")
+            st.write("✓ DALL-E 고품질")
+            st.write("✓ 의료용 스타일")
+        else:
+            st.write("○ 이미지 생성 안함")
+    
+    with col4:
+        if wordpress_result and wordpress_result.success:
+            st.metric("REST API 포스팅", "✅")
+            st.write("✓ WordPress 발행")
+            st.write(f"✓ {wordpress_result.status} 상태")
+        else:
+            st.metric("포스팅 대기", "📝")
+            st.write("○ 수동 발행 필요")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # 콘텐츠 전문 표시
+    st.markdown("### 📄 생성된 콘텐츠 전문")
+    
+    # 탭으로 구분하여 표시
+    tab1, tab2, tab3 = st.tabs(["📝 마크다운", "🌐 HTML", "📊 분석 정보"])
+    
+    with tab1:
+        st.markdown("**마크다운 형태:** (복사해서 사용하세요)")
+        st.text_area(
+            "생성된 콘텐츠 (마크다운)",
+            value=generated_content.content_markdown,
+            height=400,
+            help="Ctrl+A로 전체 선택 후 복사하세요"
+        )
+    
+    with tab2:
+        st.markdown("**HTML 형태:**")
+        st.text_area(
+            "생성된 콘텐츠 (HTML)",
+            value=generated_content.content_html,
+            height=400,
+            help="워드프레스나 다른 사이트에 바로 붙여넣기 가능"
+        )
+        
+        st.markdown("**HTML 미리보기:**")
+        try:
+            st.components.v1.html(generated_content.content_html, height=600, scrolling=True)
+        except:
+            st.markdown(generated_content.content_html, unsafe_allow_html=True)
+    
+    with tab3:
+        st.markdown("**분석 정보:**")
+        analysis_info = f"""제목: {generated_content.title}
+슬러그: {generated_content.slug}
+메타 설명: {generated_content.meta_description}
+태그: {', '.join(generated_content.tags)}
+예상 읽기 시간: {generated_content.estimated_reading_time}분
+총 글자수: {len(generated_content.content_markdown):,}자
+SEO 점수: {generated_content.seo_score:.2f}
+의료광고법 준수: {generated_content.medical_compliance_score:.2f}
+
+=== 담당자 정보 ===
+담당자: {analysis_result.employee.name}
+부서: {analysis_result.employee.department}
+직책: {analysis_result.employee.position}
+경력: {analysis_result.employee.experience_years}년
+전문분야: {', '.join(analysis_result.employee.specialty_areas)}
+말투 특성: {analysis_result.personality.tone_style}
+
+=== FAQ 목록 ==="""
+        
+        for i, faq in enumerate(generated_content.faq_list, 1):
+            analysis_info += f"\nQ{i}: {faq['question']}\nA{i}: {faq['answer']}\n"
+        
+        st.text_area("분석 및 메타데이터", value=analysis_info, height=400)
+    
+    # 다운로드 옵션
+    st.markdown("### 📎 다운로드 옵션")
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        st.download_button(
+            label="📄 텍스트 파일 다운로드",
+            data=generated_content.content_markdown,
+            file_name=f"{generated_content.slug}.txt",
+            mime="text/plain"
+        )
+    
+    with col2:
+        st.download_button(
+            label="📄 마크다운 다운로드", 
+            data=generated_content.content_markdown,
+            file_name=f"{generated_content.slug}.md",
+            mime="text/markdown"
+        )
+    
+    with col3:
+        st.download_button(
+            label="🌐 HTML 다운로드", 
+            data=generated_content.content_html,
+            file_name=f"{generated_content.slug}.html",
+            mime="text/html"
+        )
+    
+    # 워드프레스 링크
+    if wordpress_result and wordpress_result.success:
+        st.markdown("### 🔗 워드프레스 링크")
+        st.success(f"**포스트 보기**: [클릭하여 확인]({wordpress_result.post_url})")
+        st.info(f"**편집하기**: [관리자에서 편집]({wordpress_result.edit_url})")
+        
+        if wordpress_result.status == "draft":
+            st.warning("💡 현재 초안 상태입니다. 워드프레스 관리자에서 검토 후 발행하세요.")
+    
+    # 생성된 이미지 다운로드
+    if generated_images:
+        st.markdown("### 📥 이미지 다운로드")
+        
+        for i, (img, alt_text) in enumerate(generated_images):
+            col1, col2 = st.columns([1, 2])
             
-            for i, (img, alt_text) in enumerate(generated_images):
-                col1, col2 = st.columns([1, 2])
+            with col1:
+                st.image(img, width=200)
+            
+            with col2:
+                img_bytes = io.BytesIO()
+                img.save(img_bytes, format='JPEG', quality=95)
                 
-                with col1:
-                    st.image(img, width=200)
-                
-                with col2:
-                    img_bytes = io.BytesIO()
-                    img.save(img_bytes, format='JPEG', quality=95)
-                    
-                    st.download_button(
-                        label=f"📷 이미지 {i+1} 다운로드",
-                        data=img_bytes.getvalue(),
-                        file_name=f"{generated_content.slug}_image_{i+1}.jpg",
-                        mime="image/jpeg"
-                    )
-                    st.caption(alt_text)
-
-# 필수 라이브러리 체크 함수
-def check_dependencies():
-    """필수 라이브러리 설치 상태 체크"""
-    missing_libs = []
-    
-    if not WORDPRESS_AVAILABLE:
-        missing_libs.append("python-wordpress-xmlrpc")
-    
-    if not GOOGLE_SHEETS_AVAILABLE:
-        missing_libs.append("google-api-python-client google-auth-httplib2 google-auth-oauthlib gspread")
-    
-    if missing_libs:
-        st.warning(f"""
-        ⚠️ **선택적 라이브러리 미설치**
-        
-        다음 기능을 사용하려면 추가 라이브러리 설치가 필요합니다:
-        
-        {"".join([f"- `pip install {lib}`" for lib in missing_libs])}
-        """)
-
-# 사용 예시 및 테스트 함수
-def run_sample_test():
-    """샘플 테스트 실행"""
-    sample_interview = """
-    저는 밝은눈안과 홍보팀에 이예나 대리고요. 
-    지금 경력은 병원 마케팅 쪽은 지금 거의 10년 정도 다 돼 가고 있습니다.
-    여기서는 이제 대학팀에 같이 있고요. 대학 제휴랑 출장검진을 담당하고 있습니다.
-    솔직하게 말씀드리면 저희 병원은 26년간 의료사고가 없었다는 점이 장점이고,
-    잠실 롯데타워 위치가 정말 좋아서 고객님들이 만족해하시는 편이에요.
-    """
-    
-    if not Settings.OPENAI_API_KEY:
-        print("❌ OpenAI API 키가 설정되지 않았습니다.")
-        return
-    
-    try:
-        print("🔍 인터뷰 분석 테스트...")
-        analyzer = InterviewAnalyzer()
-        result = analyzer.analyze_interview(sample_interview)
-        
-        print(f"✅ 분석 완료!")
-        print(f"직원명: {result.employee.name}")
-        print(f"부서: {result.employee.department}")
-        print(f"신뢰도: {result.analysis_metadata['confidence_score']:.2f}")
-        
-        print("\n📝 콘텐츠 생성 테스트...")
-        generator = ContentGenerator()
-        content = generator.generate_content(result)
-        
-        print(f"✅ 콘텐츠 생성 완료!")
-        print(f"제목: {content.title}")
-        print(f"SEO 점수: {content.seo_score:.2f}")
-        
-        print("\n🎉 모든 테스트 통과!")
-        
-    except Exception as e:
-        print(f"❌ 테스트 실패: {str(e)}")
+                st.download_button(
+                    label=f"🖼️ 이미지 {i+1} 다운로드",
+                    data=img_bytes.getvalue(),
+                    file_name=f"{generated_content.slug}_image_{i+1}.jpg",
+                    mime="image/jpeg"
+                )
+                st.caption(alt_text)
 
 # ========================================
-# 메인 실행부
-# ========================================
-
-if __name__ == "__main__":
-    try:
-        # 의존성 체크
-        check_dependencies()
-        
-        # Streamlit 앱 실행
-        main()
-        
-    except Exception as e:
-        st.error(f"❌ 시스템 오류: {str(e)}")
-        st.info("💡 .env 파일 설정을 확인하거나 필수 라이브러리를 설치하세요.")
-
-# ========================================
-# 추가 유틸리티 함수들
+# 유틸리티 함수들
 # ========================================
 
 def create_sample_env_file():
     """샘플 .env 파일 생성"""
     sample_content = """
-# OpenAI API 설정
+# OpenAI API 설정 (필수)
 OPENAI_API_KEY=your_openai_api_key_here
 
-# 워드프레스 설정 (선택적)
+# 워드프레스 REST API 설정 (선택적)
 WORDPRESS_URL=https://your-wordpress-site.com
 WORDPRESS_USERNAME=your_username
 WORDPRESS_PASSWORD=your_app_password
@@ -1797,77 +2132,117 @@ GOOGLE_CREDENTIALS_FILE=credentials.json
 LOG_LEVEL=INFO
     """.strip()
     
-    with open('.env.example', 'w', encoding='utf-8') as f:
-        f.write(sample_content)
-    
-    print("📄 .env.example 파일이 생성되었습니다.")
-    print("💡 이 파일을 .env로 복사하고 실제 값으로 수정하세요.")
-
-def export_analysis_data(analysis_result: InterviewAnalysisResult, output_file: str = None):
-    """분석 결과를 JSON으로 내보내기"""
-    if output_file is None:
-        output_file = f"analysis_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(asdict(analysis_result), f, ensure_ascii=False, indent=2, default=str)
-    
-    return output_file
-
-# CLI 모드 지원
-def run_cli_mode():
-    """CLI 모드로 실행"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='BGN 블로그 자동화 CLI')
-    parser.add_argument('--interview', required=True, help='인터뷰 텍스트 파일 경로')
-    parser.add_argument('--output', default='output', help='출력 디렉토리')
-    parser.add_argument('--no-images', action='store_true', help='이미지 생성 건너뛰기')
-    parser.add_argument('--test', action='store_true', help='테스트 모드 실행')
-    
-    args = parser.parse_args()
-    
-    if args.test:
-        run_sample_test()
-        return
-    
-    # 인터뷰 파일 읽기
-    with open(args.interview, 'r', encoding='utf-8') as f:
-        interview_content = f.read()
-    
-    # 출력 디렉토리 생성
-    os.makedirs(args.output, exist_ok=True)
-    
     try:
-        # 분석 실행
-        analyzer = InterviewAnalyzer()
-        analysis_result = analyzer.analyze_interview(interview_content)
+        with open('.env.example', 'w', encoding='utf-8') as f:
+            f.write(sample_content)
         
-        # 콘텐츠 생성
-        generator = ContentGenerator()
-        generated_content = generator.generate_content(analysis_result)
-        
-        # 결과 저장
-        with open(f"{args.output}/content.md", 'w', encoding='utf-8') as f:
-            f.write(generated_content.content_markdown)
-        
-        with open(f"{args.output}/content.html", 'w', encoding='utf-8') as f:
-            f.write(generated_content.content_html)
-        
-        export_analysis_data(analysis_result, f"{args.output}/analysis.json")
-        
-        # 이미지 생성 (선택적)
-        if not args.no_images:
-            image_generator = ImageGenerator()
-            images = image_generator.generate_blog_images(generated_content)
-            
-            for i, (img, alt_text) in enumerate(images):
-                img.save(f"{args.output}/image_{i+1}.jpg", quality=95)
-        
-        print(f"✅ 완료! 결과가 {args.output} 디렉토리에 저장되었습니다.")
+        print("📄 .env.example 파일이 생성되었습니다.")
+        print("💡 이 파일을 .env로 복사하고 실제 값으로 수정하세요.")
         
     except Exception as e:
-        print(f"❌ CLI 실행 실패: {str(e)}")
+        print(f"❌ .env.example 파일 생성 실패: {str(e)}")
 
-# 스크립트 직접 실행 시
-if __name__ == "__main__" and len(sys.argv) > 1:
-    run_cli_mode()
+def run_simple_test():
+    """간단한 테스트 실행"""
+    sample_interview = """
+    저는 밝은눈안과 홍보팀에 이예나 대리고요. 
+    지금 경력은 병원 마케팅 쪽은 지금 거의 10년 정도 다 되어 가고 있습니다.
+    여기서는 이제 대학팀에 같이 있고요. 대학 제휴랑 출장검진을 담당하고 있습니다.
+    """
+    
+    try:
+        print("🔍 인터뷰 분석 테스트...")
+        analyzer = SafeInterviewAnalyzer()
+        result = analyzer.analyze_interview(sample_interview)
+        
+        print(f"✅ 분석 완료!")
+        print(f"직원명: {result.employee.name}")
+        print(f"부서: {result.employee.department}")
+        print(f"신뢰도: {result.analysis_metadata['confidence_score']:.2f}")
+        
+        print("\n📝 콘텐츠 생성 테스트...")
+        generator = SafeContentGenerator()
+        content = generator.generate_content(result)
+        
+        print(f"✅ 콘텐츠 생성 완료!")
+        print(f"제목: {content.title}")
+        print(f"SEO 점수: {content.seo_score:.2f}")
+        
+        print("\n🎉 모든 테스트 통과!")
+        
+    except Exception as e:
+        print(f"❌ 테스트 실패: {str(e)}")
+        print("💡 .env 파일에 OPENAI_API_KEY가 설정되어 있는지 확인하세요.")
+
+# ========================================
+# 메인 실행부
+# ========================================
+
+if __name__ == "__main__":
+    try:
+        # CLI 인수 확인
+        if len(sys.argv) > 1:
+            if "--test" in sys.argv:
+                run_simple_test()
+            elif "--create-env" in sys.argv:
+                create_sample_env_file()
+            else:
+                print("사용법:")
+                print("  streamlit run main.py       # 웹 UI 실행")
+                print("  python main.py --test       # 테스트 실행")
+                print("  python main.py --create-env # .env 샘플 생성")
+        else:
+            # Streamlit 앱 실행
+            main()
+        
+    except Exception as e:
+        print(f"❌ 시스템 오류: {str(e)}")
+        print("💡 다음을 확인하세요:")
+        print("  1. 필수 라이브러리 설치: pip install streamlit openai pillow requests python-dotenv")
+        print("  2. .env 파일에 OPENAI_API_KEY 설정")
+        print("  3. 워드프레스 REST API는 앱 패스워드 사용")
+
+# ========================================
+# 추가 정보 및 도움말
+# ========================================
+
+"""
+BGN 밝은눈안과 블로그 자동화 시스템 v3.0 (REST API 버전)
+
+🔧 주요 개선사항:
+- XML-RPC 문제 완전 해결: WordPress REST API 사용
+- 실시간 API 연결 테스트 기능
+- 향상된 오류 처리 및 디버깅
+- 자동 카테고리/태그 생성
+- 앱 패스워드 안내 및 인증 개선
+
+📋 설치 가이드:
+1. 필수 라이브러리:
+   pip install streamlit openai pillow requests python-dotenv
+
+2. 선택적 라이브러리:
+   pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib gspread
+
+3. 환경 설정:
+   - .env 파일에 OPENAI_API_KEY 설정
+   - 워드프레스 앱 패스워드 생성 및 설정
+   - 구글 시트 연동시 시트 ID 및 인증 파일 설정
+
+🚀 실행 방법:
+- 웹 UI: streamlit run main.py
+- 테스트: python main.py --test
+- 환경 파일 생성: python main.py --create-env
+
+💡 REST API 장점:
+- ✅ 403 Forbidden 오류 해결
+- ✅ 더 안전하고 현대적
+- ✅ 실시간 연결 상태 확인
+- ✅ 자동 미디어 업로드
+- ✅ 향상된 오류 처리
+
+🔧 문제 해결:
+- API 오류: .env 파일의 API 키 확인
+- 워드프레스 연결 실패: 앱 패스워드 및 URL 확인
+- 이미지 생성 실패: OpenAI 크레딧 확인
+- 구글 시트 오류: 인증 파일과 권한 확인
+"""
